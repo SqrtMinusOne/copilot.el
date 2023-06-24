@@ -27,7 +27,7 @@ Format: '(:host \"127.0.0.1\" :port 80 :username \"username\" :password \"passwo
 Username and password are optional.
 
 If you are using a MITM proxy which intercepts TLS connections, you may need to disable
-TLS verification. This can be done by setting a pair ':rejectUnauthorized :json-false' 
+TLS verification. This can be done by setting a pair ':rejectUnauthorized :json-false'
 in the proxy plist. For example:
 
   (:host \"127.0.0.1\" :port 80 :rejectUnauthorized :json-false)
@@ -61,6 +61,28 @@ Enabling event logging may slightly affect performance."
   "List of commands that should not clear the overlay when called."
   :group 'copilot
   :type '(repeat function))
+
+(defcustom copilot-lispy-integration nil
+  "Enable lispy integration.
+
+This should help with cases when accepting a completion result in
+unbalanced parentheses."
+  :group 'copilot
+  :type 'boolean)
+
+(defcustom copilot-insert-completion-hooks
+  '(copilot--insert-completion-lispy
+    copilot--insert-completion-vterm
+    copilot--insert-completion-plain)
+  "Functions to insert completions.
+
+The first function that returns non-nil will be considered as used.
+
+The function should take two arguments: the completion string and
+the point where to insert it.  Take a look at
+`copilot--insert-completion-plain' for a basic implementation."
+  :group 'copilot
+  :type 'hook)
 
 (defconst copilot--base-dir
   (file-name-directory
@@ -543,6 +565,39 @@ To work around posn problems with after-string property.")
     (delete-overlay copilot--overlay)
     (setq copilot--real-posn nil)))
 
+;; XXX to avoid (require 'lispy) and shut up the byte compiler.
+(declare-function lispy--maybe-safe-delete-region "lispy")
+(declare-function lispy--find-safe-regions "lispy")
+
+(defun copilot--insert-completion-lispy (completion start)
+  "Insert COMPLETION at point START with lispy."
+  (when (and copilot-lispy-integration
+             (bound-and-true-p lispy-mode))
+    (progn
+      (lispy--maybe-safe-delete-region start (line-end-position))
+      (insert
+       (with-temp-buffer
+         (insert completion)
+         (let ((safe-regions (lispy--find-safe-regions (point-min) (point-max)))
+               safe-strings)
+           (dolist (safe-region safe-regions)
+             (push (filter-buffer-substring (car safe-region) (cdr safe-region))
+                   safe-strings))
+           (apply #'concat safe-strings))))
+      t)))
+
+(defun copilot--insert-completion-plain (completion start)
+  "Insert COMPLETION at point START."
+  (delete-region start (line-end-position))
+  (insert completion)
+  t)
+
+(defun copilot--insert-completion-vterm (completion start)
+  (when (eq major-mode 'vterm-mode)
+    (vterm-delete-region start end)
+    (vterm-insert t-completion)
+    t))
+
 (defun copilot-accept-completion (&optional transform-fn)
   "Accept completion. Return t if there is a completion.
 Use TRANSFORM-FN to transform completion if provided."
@@ -555,12 +610,9 @@ Use TRANSFORM-FN to transform completion if provided."
            (t-completion (funcall (or transform-fn #'identity) completion)))
       (copilot--async-request 'notifyAccepted (list :uuid uuid))
       (copilot-clear-overlay t)
-      (if (eq major-mode 'vterm-mode)
-          (progn
-            (vterm-delete-region start end)
-            (vterm-insert t-completion))
-        (delete-region start end)
-        (insert t-completion))
+      (run-hook-with-args-until-success
+       'copilot-insert-completion-hooks
+       t-completion start)
       ; if it is a partial completion
       (when (and (s-prefix-p t-completion completion)
                  (not (s-equals-p t-completion completion)))
